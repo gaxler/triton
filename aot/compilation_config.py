@@ -1,18 +1,19 @@
 from itertools import product
 from dataclasses import dataclass
-from typing import Any, Dict, Mapping, Sequence, Tuple, Union
+from typing import Dict, Iterator, Mapping, Sequence, Tuple, Union
 from triton.code_gen import JITFunction
 
-from abstract_values import (
+from .abstract_values import (
     AbstractInt,
     AbstractFloat,
     AbstractBool,
     AbstractPtr,
+    AbstractValue,
     DummyCudaDevice,
-    TYPE_MAKERS
+    TYPE_MAKERS,
 )
 
-from _types import ModuleScope
+from ._types import ModuleScope, NamedVariantsMap
 
 
 class ConfigKeys:
@@ -20,10 +21,11 @@ class ConfigKeys:
     COMPILATION_CONFIG = "compile_params"
     KERNEL_SIGNITURES = "kernels"
     INPUT_TYPES = "types"
-    TPYE_VARIANTS = "type_variants"
+    TYPE_VARIANTS = "type_variants"
     META_INPUT = "meta"
     POINTER_TYPE = "*"
     UNIQUE_VARIANT = "^"
+    IGNORE_SYMBOL = "_"
 
 
 def dict_product(d):
@@ -31,10 +33,10 @@ def dict_product(d):
     for element in product(*d.values()):
         yield dict(zip(keys, element))
 
-ValueMaker = Union[AbstractInt, AbstractFloat, AbstractBool]
+
+AbstractValueMaker = Union[AbstractInt, AbstractFloat, AbstractBool]
 MetaValue = Union[int, float, bool, str]
 TypeVariant = str
-NamedVariantsMap = Mapping[str, Sequence[int]]
 
 
 @dataclass
@@ -48,26 +50,37 @@ class CompileParams:
         return cls(**d)
 
 
+def abstract_signature_generator(
+    pointers: Sequence[AbstractPtr],
+    variants: Sequence[TypeVariant],
+    named_variants: NamedVariantsMap,
+    abs_value_makers: Sequence[AbstractValueMaker],
+) -> Iterator[Sequence[AbstractValue]]:
+    for prod_vals in dict_product(named_variants):
+        abstract_vals = [
+            f(v) for f, v in zip(abs_value_makers, map(prod_vals.__getitem__, variants))
+        ]
+        yield pointers[:] + abstract_vals
+
+
 @dataclass
 class KernelSignitureConfig:
     name: str
     pointers: Sequence[AbstractPtr]
-    abs_val_makers: Sequence[ValueMaker]
+    abs_val_makers: Sequence[AbstractValueMaker]
     meta: Mapping[str, MetaValue]
-    named_variants: Mapping[str, Sequence[int]]
+    named_variants: NamedVariantsMap
     variants: Sequence[TypeVariant]
     compile_params: CompileParams
 
     def signiture_iter(self):
         """ Iterate over all variants of abstract inputs """
-        for prod_vals in dict_product(self.named_variants):
-            abstract_vals = [
-                f(v)
-                for f, v in zip(
-                    self.abs_val_makers, map(prod_vals.__getitem__, self.variants)
-                )
-            ]
-            yield self.pointers[:] + abstract_vals
+        return abstract_signature_generator(
+            pointers=self.pointers,
+            variants=self.variants,
+            named_variants=self.named_variants,
+            abs_value_makers=self.abs_val_makers,
+        )
 
 
 def parse_named_variants(global_named_variants: Mapping[str, str]) -> NamedVariantsMap:
@@ -81,7 +94,10 @@ def parse_named_variants(global_named_variants: Mapping[str, str]) -> NamedVaria
     Turn string variants into integers
     """
     # TODO: parse error messages
-    return {var_name: [int(x) for x in global_named_variants[var_name].split(",")] for var_name in global_named_variants}
+    return {
+        var_name: [int(x) for x in global_named_variants[var_name].split(",")]
+        for var_name in global_named_variants
+    }
 
 
 def parse_meta(meta_kwargs: Dict, module_scope: ModuleScope):
@@ -119,7 +135,9 @@ def parse_meta(meta_kwargs: Dict, module_scope: ModuleScope):
     return meta
 
 
-def _parse_type_size_variants(var_ident: Sequence[str], nv: NamedVariantsMap) -> Tuple[Sequence[str], NamedVariantsMap]:
+def _parse_type_size_variants(
+    var_ident: Sequence[str], nv: NamedVariantsMap
+) -> Tuple[Sequence[str], NamedVariantsMap]:
     """
     Type variants defined in a global scope (visible to all kernels). 
     This function generates per kernel version of named variants.
@@ -136,10 +154,10 @@ def _parse_type_size_variants(var_ident: Sequence[str], nv: NamedVariantsMap) ->
     locl_nv = {}
     variant_keys = []
     for v in var_ident:
-        if v == "_":
+        if v == ConfigKeys.IGNORE_SYMBOL:
             continue
         if v[-1] == ConfigKeys.UNIQUE_VARIANT:
-            # Create unique name for 
+            # Create unique name for
             name = f"vv{private_var_count}"
             private_var_count += 1
             # TODO: propper named variant selection
@@ -152,19 +170,9 @@ def _parse_type_size_variants(var_ident: Sequence[str], nv: NamedVariantsMap) ->
     return variant_keys, locl_nv
 
 
-def parse_kernel(
-    name: str,
-    fconf: Mapping,
-    named_variants: Mapping[str, Sequence[int]],
-    compile_conf: CompileParams,
-    module_scope: ModuleScope = None,
-) -> KernelSignitureConfig:
-    """
-    Parse config files and prepare abstract kernel inputs for compilation optimization.
-    """
-
-    tys = [v.strip() for v in fconf.get(ConfigKeys.INPUT_TYPES, "").split(",")]
-    ty_vars = [v.strip() for v in fconf.get(ConfigKeys.TPYE_VARIANTS, "").split(",")]
+def prep_data_for_signature_generators(
+    tys: Sequence[str], ty_vars: Sequence[str], named_variants: NamedVariantsMap
+):
     pointers = []
     type_makers = []
 
@@ -180,6 +188,30 @@ def parse_kernel(
             type_makers.append(ty_cls)
 
     variant_keys, local_named_vars = _parse_type_size_variants(ty_vars, named_variants)
+
+    return pointers, type_makers, variant_keys, local_named_vars
+
+
+def parse_kernel(
+    name: str,
+    fconf: Mapping,
+    named_variants: Mapping[str, Sequence[int]],
+    compile_conf: CompileParams,
+    module_scope: ModuleScope = None,
+) -> KernelSignitureConfig:
+    """
+    Parse config files and prepare abstract kernel inputs for compilation optimization.
+    """
+
+    tys = [v.strip() for v in fconf.get(ConfigKeys.INPUT_TYPES, "").split(",")]
+    ty_vars = [v.strip() for v in fconf.get(ConfigKeys.TYPE_VARIANTS, "").split(",")]
+
+    (
+        pointers,
+        type_makers,
+        variant_keys,
+        local_named_vars,
+    ) = prep_data_for_signature_generators(tys, ty_vars, named_variants)
 
     meta = parse_meta(fconf.get(ConfigKeys.META_INPUT, {}), module_scope)
 
@@ -202,7 +234,7 @@ def parse_kernel(
 def parse_compilation_config(
     conf: Dict, module_scope: ModuleScope = None
 ) -> Mapping[str, KernelSignitureConfig]:
-    
+
     named_variants = parse_named_variants(conf.get(ConfigKeys.NAMED_VARIANTS, {}))
     compile_conf = CompileParams.from_dict(conf.get(ConfigKeys.COMPILATION_CONFIG, {}))
 
@@ -216,3 +248,29 @@ def parse_compilation_config(
         )
         for func_name, fconf in conf.get(ConfigKeys.KERNEL_SIGNITURES, {}).items()
     }
+
+
+def sig_generator(
+    pointers: Sequence[str],
+    attributes: Sequence[str],
+    attr_vars: Sequence[str],
+    named_vars: NamedVariantsMap,
+) -> Iterator[Sequence[AbstractValue]]:
+
+    sig = [f"{p}{ConfigKeys.POINTER_TYPE}" for p in pointers] + attributes
+    type_variants = [ConfigKeys.IGNORE_SYMBOL] * len(pointers) + attr_vars
+
+    (
+        pointers,
+        type_makers,
+        variant_keys,
+        local_named_vars,
+    ) = prep_data_for_signature_generators(sig, type_variants, named_vars)
+
+    return abstract_signature_generator(
+        pointers=pointers,
+        variants=variant_keys,
+        abs_value_makers=type_makers,
+        named_variants=local_named_vars,
+    )
+

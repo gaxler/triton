@@ -5,8 +5,19 @@ class AbstractValue:
     def tt_dtype(self):
         return self._tt_dtype
 
+    @property
+    def is_attr(self):
+        return hasattr(self, "num")
+
+    @property
+    def val(self):
+        if self.is_attr:
+            return self.num
+
     def __eq__(self, o: object) -> bool:
-        return self.num == o
+        if self.is_attr:
+            return self.num == o
+        return self is o
 
     def __repr__(self) -> str:
         cls_name = self.__class__.__name__.replace("Input", "")
