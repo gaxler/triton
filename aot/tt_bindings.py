@@ -5,9 +5,9 @@ import importlib.util
 
 from triton.code_gen import JITFunction
 
-from aot_kernel import AOTKernel
+from .aot_kernel import AOTKernel
 
-from _types import ModuleScope
+from ._types import ModuleScope
 
 
 def execute_module(fpath):

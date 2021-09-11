@@ -4,7 +4,7 @@ import binascii
 from typing import Sequence, Tuple
 
 
-from abstract_values import AbstractPtr, AbstractValue
+from .abstract_values import AbstractPtr, AbstractValue
 
 @dataclass
 class LibCudaConf:
