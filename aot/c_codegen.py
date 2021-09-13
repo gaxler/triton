@@ -1,8 +1,7 @@
-from inspect import signature
-from pathlib import Path
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import binascii
-from typing import Mapping, Sequence, Tuple
+from pathlib import Path
+from typing import Sequence, Tuple
 
 
 from .abstract_values import AbstractPtr, AbstractValue
@@ -62,13 +61,14 @@ def py_str_to_uchar_array(txt: str) -> Tuple[str, int]:  # (c_code, array len)
     data = ", ".join([f"0x{x}{next(it)}" for x in it])
     return data, len(hex_)
 
+
 @dataclass
 class CSource:
     name: str
 
     @property
     def include(self):
-        return f'#include "{self.name}.h'
+        return f'#include "{self.name}.h"'
 
     @property
     def header(self):
@@ -82,32 +82,35 @@ class CSource:
             return self._source
         return None
 
+
 @dataclass
 class CommonHeader(CSource):
     name: str = "common"
 
     def __post_init__(self):
         header = """
-        #pragma once
+#pragma once
 
-        #include <stdint.h>
-        #include <inttypes.h>
-        #include <cuda.h>
+#include <stdio.h>
+#include <stdint.h>
+#include <inttypes.h>
+#include <cuda.h>
 
-        typedef struct
-        {
-            int gX;
-            int gY;
-            int gZ;
-            int numWarps;
-        } GridWarps;
-        """
+typedef struct
+{
+    int gX;
+    int gY;
+    int gZ;
+    int numWarps;
+} GridWarps;
+
+"""
 
         self._header = header
 
 
 @dataclass
-class SingleKernel(CSource):
+class _SingleKernel(CSource):
     # name: str
     triton_output: str
     attr_sizes: Sequence[int]
@@ -124,46 +127,44 @@ class SingleKernel(CSource):
             "hex_": hex_,
             "num_args": len(signeture),
             "arg_pointers": signeture.arg_pointers(),
-            "threads_per_warp": THREADS_PER_WARP
+            "threads_per_warp": THREADS_PER_WARP,
         }
 
         header = """
-        unsigned char {name}_ptx[{bin_size}];
-        CUfunction load_{name}(void);
-        CUresult {name}(CUstream stream, GridWarps g, {kernel_signeture});
-        """
+unsigned char {name}_ptx[{bin_size}];
+CUfunction load_{name}(void);
+CUresult {name}(CUstream stream, GridWarps g, {kernel_signeture});
+"""
 
         source = """
-        unsigned char {name}_ptx[{bin_size}] = 
-        {{
-            {hex_}
-        }};
+unsigned char {name}_ptx[{bin_size}] = 
+{{
+    {hex_}
+}};
 
-        CUfunction load_{name}(void)
-        {{
-            CUmodule mod_ptr;
-            CUfunction func;
-            CUresult err;
-            void *image = (void *)&{name}_ptx;
-            err = cuModuleLoadData(&mod_ptr, image);
-            if (err != 0) {{
-	            return NULL;
-            }}
-            err = cuModuleGetFunction(&func, mod_ptr, "{name}");
-            if (err != 0) {{
-                return NULL;
-            }}
-            return func;
-        }}
+CUfunction load_{name}(void)
+{{
+    CUmodule mod_ptr;
+    CUfunction func;
+    CUresult err;
+    void *image = (void *)&{name}_ptx;
+    err = cuModuleLoadData(&mod_ptr, image);
+    if (err != 0) {{
+        return NULL;
+    }}
+    err = cuModuleGetFunction(&func, mod_ptr, "{name}");
+    if (err != 0) {{
+        return NULL;
+    }}
+    return func;
+}}
 
-        CUresult {name}(CUstream stream, GridWarps g, {kernel_signeture})
-        {{
-            CUfunction func = load_{name}();
-            void *args[{num_args}] = {{
-                {arg_pointers}
-        }};
-        return cuLaunchKernel(func, g.gX, g.gY, g.gZ, g.numWarps * {threads_per_warp}, 1, 1, 0, stream, args, NULL);
-        }}
+CUresult {name}(CUstream stream, GridWarps g, {kernel_signeture})
+{{
+    CUfunction func = load_{name}();
+    void *args[{num_args}] = {{ {arg_pointers} }};
+    return cuLaunchKernel(func, g.gX, g.gY, g.gZ, g.numWarps * {threads_per_warp}, 1, 1, 0, stream, args, NULL);
+}}
         """
 
         self._header = header.format(**data)
@@ -184,13 +185,11 @@ class SingleKernel(CSource):
 @dataclass
 class KernelDispatcher(CSource):
     name: str
-    common: CommonHeader = CommonHeader()
 
     def __post_init__(self):
         self._header = None
         self._source = None
         self.kernels = []
-
 
     def add_kernel(
         self,
@@ -201,35 +200,30 @@ class KernelDispatcher(CSource):
     ):
         new_ker_name = f"{self.name}_" + "_".join(map(str, attribute_values))
         ptx = triton_output.replace(self.name, new_ker_name)
-        single_ker = SingleKernel(
+        single_ker = _SingleKernel(
             new_ker_name, ptx, attribute_values, signeture, arg_names
         )
         self.kernels.append(single_ker)
 
-    def generate(self):
+    def generate_code(self, common_headers: Sequence[CSource]):
         disp_h, disp_c = self.dispatcher()
+        common_includes = "\n".join([h.include for h in common_headers])
         data = {
             "name": self.name,
-            "common": self.common.include,
+            "common": common_includes,
             "kernel_headers": "\n\n".join([k.header for k in self.kernels]),
             "kernel_sources": "\n\n".join([k.source for k in self.kernels]),
             "dispatcher_header": disp_h,
             "dispatcher_source": disp_c,
         }
 
-        header = """
-        {common}
-
-        {kernel_headers}
-        {dispatcher_header}
-        """
-
+        header = "{common}\n{kernel_headers}\n{dispatcher_header}"
         source = """
-        #include "{name}.h"
+#include "{name}.h"
 
-        {kernel_sources}
+{kernel_sources}
 
-        {dispatcher_source}
+{dispatcher_source}
         """
 
         self._header = header.format(**data)
@@ -237,10 +231,11 @@ class KernelDispatcher(CSource):
 
     def dispatcher(self):
         last_kernel = self.kernels[-1]
-        header = f"CUresult {self.name}(CUstream stream, GridWarps g, {last_kernel.signeture()});"
+        dispatch_sign = f"CUresult {self.name}(CUstream stream, GridWarps g, {last_kernel.signeture()})"
+        header = f"{dispatch_sign};"
 
         conds = [
-            f"if ({k.dispatch_cond()}) {{\n\t\treturn {k.name}(stream, g, {', '.join(k.arg_names)});\n\t}}"
+            f"if ({k.dispatch_cond()}) {{\n\treturn {k.name}(stream, g, {', '.join(k.arg_names)});\n}}"
             for k in self.kernels[:-1]
         ]
         conds = "\n\t".join(conds)
@@ -250,12 +245,56 @@ class KernelDispatcher(CSource):
         )
 
         source = """
-        {header} {{
-        {conds}
-            return {last_return};
-        }}
-        """.format(
+{dispatch_sign} {{
+{conds}
+    return {last_return};
+}}
+""".format(
             **locals()
         )
 
         return header, source
+
+
+@dataclass
+class KernelLibrarySource:
+    common_headers: Sequence[CSource] = field(init=False)
+    kernel_modules: Sequence[KernelDispatcher] = field(init=False)
+
+    def __post_init__(self):
+        # TODO: if allow adding, make sure names are unique
+        self.common_headers = [CommonHeader()]
+        self.kernel_modules = []
+
+    def add(self, kernel: KernelDispatcher):
+        kernel.generate_code(self.common_headers)
+        self.kernel_modules.append(kernel)
+
+    def _dump(
+        self,
+        output: str,
+        headers: Sequence[CSource],
+        sources: Sequence[KernelDispatcher],
+    ):
+        dst = Path(output)
+
+        for h in headers:
+            hfile = dst / f"{h.name}.h"
+            hfile.write_text(h.header)
+
+        for src in sources:
+            hfile = dst / f"{src.name}.c"
+            hfile.write_text(src.source)
+
+    def dump_last(self, output: str):
+        return self._dump(
+            output,
+            self.common_headers + [self.kernel_modules[-1]],
+            [self.kernel_modules[-1]],
+        )
+
+    def dump(self, output: str):
+        return self._dump(
+            output, self.common_headers + self.kernel_modules, self.kernel_modules
+        )
+

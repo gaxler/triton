@@ -40,7 +40,7 @@ TypeVariant = str
 
 
 @dataclass
-class CompileParams:
+class TritonCompileConfig:
     num_warps: int = 4
     num_stages: int = 4
     force_nc_cache: bool = False
@@ -71,7 +71,7 @@ class KernelSignitureConfig:
     meta: Mapping[str, MetaValue]
     named_variants: NamedVariantsMap
     variants: Sequence[TypeVariant]
-    compile_params: CompileParams
+    compile_params: TritonCompileConfig
 
     def signiture_iter(self):
         """ Iterate over all variants of abstract inputs """
@@ -196,7 +196,7 @@ def parse_kernel(
     name: str,
     fconf: Mapping,
     named_variants: Mapping[str, Sequence[int]],
-    compile_conf: CompileParams,
+    compile_conf: TritonCompileConfig,
     module_scope: ModuleScope = None,
 ) -> KernelSignitureConfig:
     """
@@ -236,7 +236,7 @@ def parse_compilation_config(
 ) -> Mapping[str, KernelSignitureConfig]:
 
     named_variants = parse_named_variants(conf.get(ConfigKeys.NAMED_VARIANTS, {}))
-    compile_conf = CompileParams.from_dict(conf.get(ConfigKeys.COMPILATION_CONFIG, {}))
+    compile_conf = TritonCompileConfig.from_dict(conf.get(ConfigKeys.COMPILATION_CONFIG, {}))
 
     return {
         func_name: parse_kernel(
