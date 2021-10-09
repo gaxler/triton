@@ -84,7 +84,7 @@ class CSource:
 
 
 @dataclass
-class CommonHeader(CSource):
+class CommonHeaderCSource(CSource):
     name: str = "common"
 
     def __post_init__(self):
@@ -110,7 +110,7 @@ typedef struct
 
 
 @dataclass
-class _SingleKernel(CSource):
+class _SingleKernelCSource(CSource):
     # name: str
     triton_output: str
     attr_sizes: Sequence[int]
@@ -184,6 +184,9 @@ CUresult {name}(CUstream stream, GridWarps g, {kernel_signeture})
 
 @dataclass
 class KernelDispatcher(CSource):
+    """
+    Dispatcher handles multiple version of the kernel, each version is optimized for a specific size of the input attributes.
+    """
     name: str
 
     def __post_init__(self):
@@ -193,14 +196,14 @@ class KernelDispatcher(CSource):
 
     def add_kernel(
         self,
-        triton_output: str,
-        attribute_values: Sequence[int],
-        signeture: Sequence[AbstractValue],
-        arg_names: Sequence[str],
+        triton_output: str, # ptx/cubin etc. Whatever cuda is going to lauch
+        attribute_values: Sequence[int], # attribute sizes  that the kernel was optimized for
+        signeture: Sequence[AbstractValue], # input signeture of the kernel (types with attribute sizes etc)
+        arg_names: Sequence[str],  # names of 
     ):
         new_ker_name = f"{self.name}_" + "_".join(map(str, attribute_values))
         ptx = triton_output.replace(self.name, new_ker_name)
-        single_ker = _SingleKernel(
+        single_ker = _SingleKernelCSource(
             new_ker_name, ptx, attribute_values, signeture, arg_names
         )
         self.kernels.append(single_ker)
@@ -230,6 +233,11 @@ class KernelDispatcher(CSource):
         self._source = source.format(**data)
 
     def dispatcher(self):
+        """
+        Generate Size Optimized Kernel Dispatcher C code. Code does the following:
+            * Determine what are the input attribute sizes 
+            * Launch the size optimized kernel
+        """
         last_kernel = self.kernels[-1]
         dispatch_sign = f"CUresult {self.name}(CUstream stream, GridWarps g, {last_kernel.signeture()})"
         header = f"{dispatch_sign};"
@@ -258,17 +266,29 @@ class KernelDispatcher(CSource):
 
 @dataclass
 class KernelLibrarySource:
+    """ 
+    Collection of Kernel Modules and their common code.
+
+    Kernels are built as dispatchers. Dispatchers read the input size and dispatch the computation to size optimized cuda kerenl.
+    """
+    default_output: str = None
     common_headers: Sequence[CSource] = field(init=False)
-    kernel_modules: Sequence[KernelDispatcher] = field(init=False)
+    kernel_dispatchers: Sequence[KernelDispatcher] = field(init=False)
 
     def __post_init__(self):
         # TODO: if allow adding, make sure names are unique
-        self.common_headers = [CommonHeader()]
-        self.kernel_modules = []
+        self.common_headers = [CommonHeaderCSource()]
+        self.kernel_dispatchers = []
+        
+        if self.default_output is not None:
+            # create temp file with common headers
+            self._dump(self.default_output, self.common_headers, [])
 
     def add(self, kernel: KernelDispatcher):
         kernel.generate_code(self.common_headers)
-        self.kernel_modules.append(kernel)
+        # self.kernel_dispatchers.append(kernel)
+        if self.default_output is not None:
+            self._dump(self.default_output, [kernel], [kernel])
 
     def _dump(
         self,
@@ -283,18 +303,18 @@ class KernelLibrarySource:
             hfile.write_text(h.header)
 
         for src in sources:
-            hfile = dst / f"{src.name}.c"
-            hfile.write_text(src.source)
+            cfile = dst / f"{src.name}.c"
+            cfile.write_text(src.source)
 
     def dump_last(self, output: str):
         return self._dump(
             output,
-            self.common_headers + [self.kernel_modules[-1]],
-            [self.kernel_modules[-1]],
+            self.common_headers + [self.kernel_dispatchers[-1]],
+            [self.kernel_dispatchers[-1]],
         )
 
     def dump(self, output: str):
         return self._dump(
-            output, self.common_headers + self.kernel_modules, self.kernel_modules
+            output, self.common_headers + self.kernel_dispatchers, self.kernel_dispatchers
         )
 

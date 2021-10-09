@@ -1,5 +1,4 @@
-from genericpath import exists
-from io import UnsupportedOperation
+import shutil
 from typing import Any, Mapping, Optional, Sequence
 from .compilation_config import sig_generator, TritonCompileConfig
 from triton.code_gen import JITFunction
@@ -32,10 +31,11 @@ class Compiler:
     def __enter__(self):
         self._called_with_context = True
         self._tmp_dir = Path(tempfile.mkdtemp(prefix="tt_aot_compiler"))
+        self.lib = KernelLibrarySource(self._tmp_dir)
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
-        import shutil
+        
         shutil.rmtree(str(self._tmp_dir))
         return
 
@@ -45,8 +45,6 @@ class Compiler:
             self.scope = {}
 
         self.scope = {v:k for k,v in filter_jit_funcs(self.scope).items()}
-
-        self.lib = KernelLibrarySource()
         return
 
     def _get_func_name(self, func: JITFunction) -> str:
@@ -57,7 +55,7 @@ class Compiler:
         if kernel_name is None:
             # func must be in calling scope
             # TODO: can someone define a compiler context and call compile in totaly different context?
-            raise ValueError("Compiler must be used as a context")
+            raise ValueError(f"The object {func.__repr__()} is not an in scope JITFunction")
         
         return kernel_name
 
@@ -96,3 +94,6 @@ class Compiler:
             print(f"\t-> Done: {sig_repr}")
         
         self.lib.add(code_gen)
+
+    def export_c_code(self, dst: str):
+        return shutil.copytree(self._tmp_dir, dst)
