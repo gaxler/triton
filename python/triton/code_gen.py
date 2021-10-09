@@ -1,16 +1,21 @@
 import ast
 import builtins
+import functools
 import inspect
 import struct
 import sys
-import tempfile
 import textwrap
-
+import hashlib
+import os
+import pickle
+import subprocess
+import os
+from .tools.disasm import extract
 import torch
 import triton
 import triton._C.libtriton.triton as _triton
-
-from .tools.disasm import extract
+from filelock import FileLock
+import dbm
 
 
 class CodeGenerator(ast.NodeVisitor):
@@ -98,7 +103,8 @@ class CodeGenerator(ast.NodeVisitor):
             arg_values = []
             for i, arg_name in enumerate(arg_names):
                 if i in self.constants:
-                    arg_values.append(self.constants[i])
+                    cst = triton.language.core._to_ir(self.constants[i], self.builder)
+                    arg_values.append(cst)
                 else:
                     if i in self.attributes:
                         is_ptr = fn.args[i].type.is_ptr()
@@ -146,7 +152,7 @@ class CodeGenerator(ast.NodeVisitor):
             values = [values]
         for name, value in zip(names, values):
             if not isinstance(value, triton.language.block):
-                value = triton.language._to_ir(value, self.builder)
+                value = triton.language.core._to_ir(value, self.builder)
             self.set_value(name, value)
 
     def visit_AugAssign(self, node):
@@ -383,7 +389,7 @@ class CodeGenerator(ast.NodeVisitor):
         if isinstance(fn, JITFunction):
             return fn(*args, generator=self, **kws)
         if hasattr(fn, '__self__') and self.is_triton_object(fn.__self__) or \
-            sys.modules[fn.__module__] is triton.language:
+            sys.modules[fn.__module__] is triton.language.core:
             return fn(*args, _builder=self.builder, **kws)
         return fn(*args, **kws)
 
@@ -411,39 +417,31 @@ class CodeGenerator(ast.NodeVisitor):
 
 
 class Binary:
-    def __init__(self, module, kernel, num_warps, num_stages, force_nc_cache, shared_mem, ir_asm):
-        # cache ir asm
-        self.ir_asm = ir_asm
-        self.module = module
-        self.kernel = kernel
+    def __init__(self, backend, name, asm, shared_mem, num_warps):
+        self.backend = backend
+        self.name = name
+        self.asm = asm
         self.shared_mem = shared_mem
         self.num_warps = num_warps
-        self.num_stages = num_stages
-        self.force_nc_cache = force_nc_cache
-        self.sass = None
 
-    def asm(self, mode):
-        if mode == 'ttir':
-            return self.ir_asm
-        if mode == 'ptx':
-            return self.module.ptx()
-        if mode == 'sass':
-            if self.sass is None:
-                cubin = self.module.cubin()
-                # get a temporary file name
-                fd, path = tempfile.mkstemp(suffix='.cubin')
-                f = open(path, 'wb')
-                f.write(cubin)
-                f.close()
-                # extract SASS from cubin
-                self.sass = extract(path, None)
-            return self.sass
-        if mode == 'llir':
-            return self.module.llir()
-        raise ValueError('Unsupported mode ' + mode)
+class LoadedBinary:
+    def __init__(self, device: int, bin: Binary):
+        module, kernel = _triton.code_gen.load_binary(bin.backend, 
+                                                      bin.name, 
+                                                      bin.asm, 
+                                                      bin.shared_mem, 
+                                                      device)
+        self.bin = bin
+        self.asm = bin.asm
+        self.module = module
+        self.kernel = kernel
+        self.device = device
 
     def __call__(self, stream, args, grid_0, grid_1=1, grid_2=1):
-        stream.enqueue(self.kernel, grid_0, grid_1, grid_2, self.num_warps * 32, 1, 1, args, self.shared_mem)
+        _triton.runtime.enqueue(self.bin.backend, stream, self.kernel,
+                                grid_0, grid_1, grid_2, 
+                                self.bin.num_warps * 32, 1, 1, 
+                                args, self.bin.shared_mem)
 
 
 class CompilationError(Exception):
@@ -466,9 +464,6 @@ class Kernel:
     @staticmethod
     def _type_name(obj):
         type_names = {
-            int: 'I',
-            float: 'f',
-            bool: 'B',
             triton.language.float8: 'f8',
             torch.bfloat16: 'bf16',
             torch.float16: 'f16',
@@ -480,12 +475,25 @@ class Kernel:
             torch.int32: 'i32',
             torch.int64: 'i64',
         }
-        return type_names[obj]
+        if hasattr(obj, 'data_ptr'):
+            return type_names[obj.dtype]
+        if isinstance(obj, int):
+            if abs(obj) <= 0xffffffff:
+                return 'I'
+            return 'L'
+        if isinstance(obj, float):
+            return 'f'
+        if isinstance(obj, bool):
+            return 'B'
+        assert False
+
+        
 
     @staticmethod
     def _to_triton_ir(context, obj):
         type_map = {
             'I': _triton.ir.type.get_int32,
+            'L': _triton.ir.type.get_int64,
             'f': _triton.ir.type.get_fp32,
             'B': _triton.ir.type.get_int1,
             'f8': _triton.ir.type.get_fp8,
@@ -501,11 +509,11 @@ class Kernel:
         }
         # convert torch.Tensor to Triton IR pointers
         if hasattr(obj, 'data_ptr'):
-            name = Kernel._type_name(obj.dtype)
+            name = Kernel._type_name(obj)
             elt_ty = type_map[name](context)
             return _triton.ir.type.make_ptr(elt_ty, 1)
         # default path returns triton.ir.type directly
-        name = Kernel._type_name(obj.__class__)
+        name = Kernel._type_name(obj)
         return type_map[name](context)
 
     @staticmethod
@@ -514,7 +522,7 @@ class Kernel:
         types_key = [None] * len(wargs)
         for i, arg in enumerate(wargs):
             prefix = 'P' if i in tensor_idxs else ''
-            suffix = Kernel._type_name(arg.dtype) if i in tensor_idxs else Kernel._type_name(arg.__class__)
+            suffix = Kernel._type_name(arg) if i in tensor_idxs else Kernel._type_name(arg)
             types_key[i] = prefix + suffix
         return tuple(types_key)
 
@@ -548,10 +556,15 @@ class Kernel:
                 raise e
             raise CompilationError(self.fn.src, node, e)
         # Compile to machine code
-        mod, ker, shared_mem, ir_asm = _triton.code_gen.add_passes_to_emit_bin(generator.module, device, num_warps, num_stages, force_nc_cache)
-        if shared_mem > device.max_shared_memory():
-            raise OutOfResources(shared_mem, device.max_shared_memory(), "shared memory")
-        return Binary(mod, ker, num_warps, num_stages, force_nc_cache, shared_mem, ir_asm)
+        if torch.version.hip is None:
+            backend = _triton.runtime.backend.CUDA
+        else:
+            backend = _triton.runtime.backend.ROCM
+        name, asm, shared_mem = _triton.code_gen.compile_ttir(backend, generator.module, device, num_warps, num_stages, force_nc_cache)
+        max_shared_memory = _triton.runtime.max_shared_memory(backend, device)
+        if shared_mem > max_shared_memory:
+            raise OutOfResources(shared_mem, max_shared_memory, "shared memory")
+        return Binary(backend, name, asm, shared_mem, num_warps)
 
     def __call__(self, *wargs, grid, num_warps=4, num_stages=2, force_nc_cache=False, **meta):
         # device inference
@@ -571,48 +584,87 @@ class Kernel:
                              " Only CUDA is supported at the moment")
 
         device = torch.device('cuda', torch.cuda.current_device())
-        tt_device = _triton.driver.cu_device(device.index, False)
-        if len(set(device_ids)) != 1 or device_ids[0] != device.index:
-            # try to enable P2P communication
-            for arg_idx, dst_idx in zip(tensor_idxs, device_ids):
-                if dst_idx != device.index:
-                    try:
-                        tt_device.enable_peer_access(wargs[arg_idx].data_ptr())
-                    except RuntimeError as e:
-                        raise RuntimeError("Cannot enable P2P access from device {} to device {}: {}"
-                                           .format(device.index, dst_idx, str(e)))
+        device_idx = device.index
+        # if len(set(device_ids)) != 1 or device_ids[0] != device_idx:
+        #     # try to enable P2P communication
+        #     for arg_idx, dst_idx in zip(tensor_idxs, device_ids):
+        #         if dst_idx != device_idx:
+        #             try:
+        #                 _triton.runtime.enable_peer_access(self.backend, wargs[arg_idx].data_ptr())
+        #             except RuntimeError as e:
+        #                 raise RuntimeError("Cannot enable P2P access from device {} to device {}: {}"
+        #                                    .format(device_idx, dst_idx, str(e)))
 
         # enqueue kernel on the current device
-        torch.cuda.set_device(device.index)
+        torch.cuda.set_device(device_idx)
         # attributes
         args = [arg.data_ptr() if i in tensor_idxs else arg for i, arg in enumerate(wargs)]
-        attributes = {i: Kernel.pow2_divisor(a) for i, a in enumerate(args) if isinstance(a, int)}
+        attributes = {i: Kernel.pow2_divisor(a) for i, a in enumerate(args) \
+                      if isinstance(a, int) and i not in self.fn.do_not_specialize}
         # transforms ints whose value is one into constants for just-in-time compilation
         constants = {i: arg for i, arg in enumerate(wargs) if isinstance(arg, int) and arg == 1}
-        # determine if we need to re-compile
+        # compute hash for caching this kernel
         types_key = Kernel._types_key(*wargs, tensor_idxs=tensor_idxs)
-        attr_key = frozenset(attributes.items())
-        meta_key = frozenset(meta.items())
-        const_key = frozenset(constants.items())
-        key = (device.type, device.index, types_key, attr_key, num_warps, num_stages, meta_key, const_key)
-        cache = self.fn.cache
-        if key not in cache:
-            # compile and cache configuration if necessary
-            cache[key] = self._compile(
-                *wargs, device=tt_device, attributes=attributes,
-                num_warps=num_warps, num_stages=num_stages, force_nc_cache=force_nc_cache, 
-                constants=constants, **meta
-            )
+        attr_key = tuple(attributes.items())
+        meta_key = tuple(sorted(meta.items()))
+        const_key = tuple(constants.items())
+        compute_capability = torch.cuda.get_device_capability(device)
+
+        key = (
+            self.fn.cache_key, version_key(), compute_capability,
+            types_key, attr_key, num_warps, num_stages, meta_key, const_key
+        )
+        key = repr(key)
+
+        # get cached binary
+        drv_cache = self.fn.drv_cache
+
+        if key not in drv_cache:
+            hashed_key = hashlib.md5(key.encode("utf-8")).hexdigest()
+
+            # create cache directory
+            cache_dir = os.environ.get('TRITON_CACHE_DIR', '/tmp/triton/')
+            if cache_dir and not os.path.exists(cache_dir):
+                os.makedirs(cache_dir, exist_ok=True)
+
+            if cache_dir:
+                bin_cache_path = os.path.join(cache_dir, hashed_key)
+                bin_lock_path = bin_cache_path + ".lock"
+            else:
+                bin_cache_path = None
+                bin_lock_path = None
+
+            binary = None
+            if bin_cache_path and os.path.exists(bin_cache_path):
+                assert bin_lock_path is not None
+                with FileLock(bin_lock_path):
+                    with open(bin_cache_path, 'rb') as f:
+                        binary = pickle.load(f)["binary"]
+            if binary is None:
+                binary = self._compile(
+                    *wargs, device=device_idx, attributes=attributes,
+                    num_warps=num_warps, num_stages=num_stages, force_nc_cache=force_nc_cache, 
+                    constants=constants, **meta
+                )
+                if bin_cache_path:
+                    assert bin_lock_path is not None
+                    with FileLock(bin_lock_path):
+                        with open(bin_cache_path + ".tmp", "wb") as f:
+                            pickle.dump({"binary": binary, "key": key}, f)
+                        os.rename(bin_cache_path + ".tmp", bin_cache_path)
+                        if JITFunction.cache_hook is not None:
+                            JITFunction.cache_hook(key=key, binary=binary)
+ 
+            drv_cache[key] = LoadedBinary(device_idx, binary)
         # pack arguments
-        fmt = ''.join(['P' if i in tensor_idxs else Kernel._type_name(arg.__class__) for i, arg in enumerate(wargs)])
+        fmt = ''.join(['P' if i in tensor_idxs else Kernel._type_name(arg) for i, arg in enumerate(wargs)])
         params = struct.pack(fmt, *args)
         # enqueue cached function into stream
-        binary = cache[key]
-        cu_stream = torch.cuda.current_stream(device.index).cuda_stream
-        stream = _triton.driver.cu_stream(cu_stream, False)
+        callable = drv_cache[key]
+        stream = torch.cuda.current_stream(device_idx).cuda_stream
         grid = grid(meta) if hasattr(grid, '__call__') else grid
-        binary(stream, params, *grid)
-        return binary
+        callable(stream, params, *grid)
+        return callable
 
 
 class Launcher:
@@ -672,18 +724,56 @@ class Autotuner:
         return self.kernel(*args, num_warps=config.num_warps, num_stages=config.num_stages, **meta, **config.meta)
 
 
+@functools.lru_cache()
+def version_key():
+    with open(triton.code_gen.__file__, "rb") as f:
+        frontend_contents = hashlib.md5(f.read()).hexdigest()
+    with open(triton._C.libtriton.__file__, "rb") as f:
+        backend_contents = hashlib.md5(f.read()).hexdigest()
+
+    try:
+        nvcc_version = hashlib.md5(subprocess.check_output(["nvcc", "--version"])).hexdigest()
+    except Exception:
+        nvcc_version = None
+    try:
+        ptxas_version = hashlib.md5(subprocess.check_output(["ptxas", "--version"])).hexdigest()
+    except Exception:
+        ptxas_version = None
+
+    return (
+        triton.__version__, frontend_contents, backend_contents,
+        nvcc_version, ptxas_version
+    )
+
 class JITFunction:
-    def __init__(self, fn):
+    
+    cache_hook = None
+
+    def _set_cache_key(self):
+        self.cache_key = (hashlib.md5(self.src.encode("utf-8")).hexdigest(), self.version)
+
+    def __init__(self, fn, version=None, do_not_specialize=None):
+        # information of wrapped function
         self.fn = fn
         self.module = fn.__module__
         self.arg_names = inspect.getfullargspec(fn).args
-        self.cache = dict()
-        self.kernel_decorators = []
+        self.version = version
         self.src = textwrap.dedent(inspect.getsource(fn))
+        self.do_not_specialize = [] if do_not_specialize is None else\
+                                 [self.arg_names.index(arg) for arg in do_not_specialize]
+        # cache for callable driver objects (e.g. CUkernel)
+        self.drv_cache = dict()
+        # cache for binaries (on-disk)
+        self._set_cache_key()
+        # JITFunction can be instantiated as kernel
+        # when called with a grid using __getitem__
+        self.kernel_decorators = []
         self.kernel = None
+        # forward docs
         self.__doc__ = fn.__doc__
 
-    # we do not parse in the constructor because
+
+    # we do not parse `src` in the constructor because
     # the user might want to monkey-patch self.src dynamically.
     # Some unit tests do this, for example.
     def parse(self):
@@ -710,10 +800,16 @@ class JITFunction:
                 raise e
             raise CompilationError(self.src, node, e)
 
+    # - when `.src` attribute is set, cache path needs
+    #   to be reinitialized
+    # - when kernel decorators change, cached kernel
+    #   needs to be cleared
     def __setattr__(self, name, value):
         if name == 'kernel_decorators':
             self.kernel = None
         super(JITFunction, self).__setattr__(name, value)
+        if name == 'src':
+            self._set_cache_key()
 
     def _init_kernel(self):
         if self.kernel is None:
@@ -724,6 +820,9 @@ class JITFunction:
 
     def __getitem__(self, grid):
         return Launcher(self._init_kernel(), grid)
+
+    def __repr__(self):
+        return f"JITFunction({self.module}:{self.fn.__name__})"
 
 
 class Config:
@@ -794,7 +893,7 @@ def heuristics(values):
     .. highlight:: python
     .. code-block:: python
 
-        @heuristics(values={'BLOCK_SIZE': lambda args: 2 ** int(math.ceil(math.log2(args[1])))})
+        @triton.heuristics(values={'BLOCK_SIZE': lambda args: 2 ** int(math.ceil(math.log2(args[1])))})
         @triton.jit
         def kernel(x_ptr, x_size, **META):
             BLOCK_SIZE = META['BLOCK_SIZE'] # smallest power-of-two >= x_size
@@ -820,7 +919,7 @@ def heuristics(values):
     return decorator
 
 
-def jit(fn):
+def jit(*args, **kwargs):
     """
     Decorator for JIT-compiling a function using the Triton compiler.
 
@@ -832,11 +931,18 @@ def jit(fn):
            * objects within the triton.language package,
            * arguments to this function,
            * other jit'd functions
-    
+
     :param fn: the function to be jit-compiled
     :type fn: Callable
     """
-    return JITFunction(fn)
+    if args:
+        assert len(args) == 1
+        assert callable(args[0])
+        return JITFunction(args[0], **kwargs)
+    else:
+        def decorator(fn):
+            return JITFunction(fn, **kwargs)
+        return decorator
 
 
 ######
@@ -844,19 +950,29 @@ def jit(fn):
 def cdiv(x, y):
     return (x + y - 1) // y
 
+def next_power_of_2(n):
+    """Return the smallest power of 2 greater than or equal to n"""
+    n -= 1
+    n |= n >> 1
+    n |= n >> 2
+    n |= n >> 4
+    n |= n >> 8
+    n |= n >> 16
+    n += 1
+    return n
 
 ######
 
-
 class TensorWrapper:
-    def __init__(self, data_ptr, dtype, device):
-        self._data_ptr = data_ptr
+    def __init__(self, base, dtype):
         self.dtype = dtype
-        self.device = device
-
+        self.base  = base
+        self.is_cuda = base.is_cuda
+        self.device = base.device
+    
     def data_ptr(self):
-        return self._data_ptr
+        return self.base.data_ptr()
 
 
 def reinterpret(tensor, dtype):
-    return TensorWrapper(tensor.data_ptr(), dtype, tensor.device)
+    return TensorWrapper(tensor, dtype)
