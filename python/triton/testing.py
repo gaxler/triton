@@ -1,9 +1,11 @@
-import torch
 import os
-from .code_gen import OutOfResources
 import subprocess
 import sys
 
+import torch
+
+import triton._C.libtriton.triton as _triton
+from .code_gen import OutOfResources
 
 try:
     import triton._C.libtriton.cutlass as _cutlass
@@ -11,6 +13,7 @@ try:
 except ImportError:
     _cutlass = None
     has_cutlass = False
+
 
 def catch_oor(kernel, pytest_handle=None):
     try:
@@ -29,6 +32,19 @@ def sparsify_tensor(x, mask, block):
     return ret
 
 
+def make_pair(shape, device="cuda", alpha=1e-2, beta=0., trans=False, data=None):
+    if data is None:
+        data = torch.randn(shape, dtype=torch.float32, device=device)
+    ref_ret = data
+    ref_ret = ref_ret * alpha + beta
+    ref_ret = ref_ret.half().float()
+    if trans:
+        ref_ret = ref_ret.t().requires_grad_()
+    ref_ret = ref_ret.detach().requires_grad_()
+    tri_ret = ref_ret.clone().detach().requires_grad_()
+    return ref_ret, tri_ret
+
+
 def cutlass_matmul(a, b):
     if _cutlass is None:
         raise RuntimeError("Cannot find cutlass library")
@@ -41,11 +57,11 @@ def cutlass_matmul(a, b):
     c = torch.empty_strided((M, N), (1, M), dtype=a.dtype, device=a.device)
     # run function
     dtype = str(a.dtype).split('.')[-1]
-    _cutlass.matmul(a.data_ptr(), b.data_ptr(), c.data_ptr(), \
-                    M, N, Ka,\
-                    a.stride(0), a.stride(1),\
-                    b.stride(0), b.stride(1),\
-                    c.stride(0), c.stride(1),\
+    _cutlass.matmul(a.data_ptr(), b.data_ptr(), c.data_ptr(),
+                    M, N, Ka,
+                    a.stride(0), a.stride(1),
+                    b.stride(0), b.stride(1),
+                    c.stride(0), c.stride(1),
                     dtype, dtype, dtype,
                     a.device.index, torch.cuda.current_stream(a.device).cuda_stream)
 
@@ -58,11 +74,16 @@ def mask_tensor(x, mask, block, value=0):
         ret[:, h, i * block:(i + 1) * block, j * block:(j + 1) * block] = value
     return ret
 
+
 def assert_almost_equal(x, y, decimal=2, err_msg=''):
     import numpy.testing as npt
     if isinstance(x, torch.Tensor):
+        if x.dtype == torch.bfloat16:
+            x = x.float()
         x = x.cpu().detach().numpy()
     if isinstance(y, torch.Tensor):
+        if y.dtype == torch.bfloat16:
+            y = y.float()
         y = y.cpu().detach().numpy()
     npt.assert_array_almost_equal(x, y, err_msg=err_msg, decimal=decimal)
 
@@ -84,24 +105,6 @@ def allclose(x, y, tol=1e-2):
     return err <= tol
 
 
-def assert_allclose(x, y, tol=1e-2):
-    assert x.dtype == y.dtype
-    assert allclose(x, y, tol)
-
-
-def random(shape, dtype, device):
-    torch.manual_seed(0)
-    if isinstance(shape, int):
-        shape = (shape, )
-    if dtype == torch.bool:
-        return torch.randint(0, 2, shape, dtype=dtype, device=device)
-    if dtype in [torch.int8, torch.int16, torch.int32, torch.int64]:
-        return torch.randint(1, 32, shape, dtype=dtype, device=device)
-    if dtype in [torch.float16, torch.float32, torch.float64]:
-        return torch.normal(0, 1, shape, dtype=dtype, device=device)
-    raise RuntimeError(f'Unknown dtype {dtype}')
-
-
 def nvsmi(attrs):
     attrs = ','.join(attrs)
     cmd = ['nvidia-smi', '-i', '0', '--query-gpu=' + attrs, '--format=csv,noheader,nounits']
@@ -109,6 +112,7 @@ def nvsmi(attrs):
     ret = out.decode(sys.stdout.encoding).split(',')
     ret = [int(x) for x in ret]
     return ret
+
 
 def do_bench(fn, warmup=25, rep=100, grad_to_none=None, percentiles=[0.5, 0.2, 0.8], record_clocks=False):
     """
@@ -139,13 +143,13 @@ def do_bench(fn, warmup=25, rep=100, grad_to_none=None, percentiles=[0.5, 0.2, 0
     torch.cuda.synchronize()
     estimate_ms = start_event.elapsed_time(end_event) / 5
     # compute number of warmup and repeat
-    n_warmup = max(1, int(warmup/estimate_ms))
-    n_repeat = max(1, int(rep/estimate_ms))
+    n_warmup = max(1, int(warmup / estimate_ms))
+    n_repeat = max(1, int(rep / estimate_ms))
     # We maintain a buffer of 256 MB that we clear
     # before each kernel call to make sure that the L2
     # doesn't contain any input data before the run
     start_event = [torch.cuda.Event(enable_timing=True) for i in range(n_repeat)]
-    end_event   = [torch.cuda.Event(enable_timing=True) for i in range(n_repeat)]
+    end_event = [torch.cuda.Event(enable_timing=True) for i in range(n_repeat)]
     cache = torch.empty(int(256e6), dtype=torch.int8, device='cuda')
     # Warm-up
     for _ in range(n_warmup):
@@ -178,6 +182,7 @@ class Benchmark:
     """
     This class is used by the :code:`perf_report` function to generate line plots with a concise API.
     """
+
     def __init__(
         self,
         x_names,
@@ -195,7 +200,7 @@ class Benchmark:
         styles=None,
     ):
         """
-        Constructor 
+        Constructor
 
         :param x_names: Name of the arguments that should appear on the x axis of the plot. If the list contains more than one element, all the arguments are assumed to have the same value.
         :type x_names: List[str]
@@ -241,9 +246,10 @@ class Mark:
         self.benchmarks = benchmarks
 
     def _run(self, bench, save_path, show_plots, print_data):
+        import os
+
         import matplotlib.pyplot as plt
         import pandas as pd
-        import os
         y_mean = bench.line_names
         y_min = [f'{x}-min' for x in bench.line_names]
         y_max = [f'{x}-max' for x in bench.line_names]
@@ -276,7 +282,7 @@ class Mark:
             xlabel = bench.xlabel if bench.xlabel else " = ".join(bench.x_names)
             ax.set_xlabel(xlabel)
             ax.set_ylabel(bench.ylabel)
-            #ax.set_title(bench.plot_name)
+            # ax.set_title(bench.plot_name)
             ax.set_xscale("log" if bench.x_log else "linear")
             ax.set_yscale("log" if bench.y_log else "linear")
             if show_plots:
@@ -313,3 +319,67 @@ def perf_report(benchmarks):
     """
     wrapper = lambda fn: Mark(fn, benchmarks)
     return wrapper
+
+
+def get_dram_gbps(backend=None, device=None):
+    ''' return DRAM bandwidth in GB/s '''
+    # assert backend == CUDA
+    if not backend:
+        backend = _triton.runtime.backend.CUDA
+    if not device:
+        device = torch.cuda.current_device()
+    mem_clock_khz = _triton.runtime.memory_clock_rate(backend, device)
+    bus_width = _triton.runtime.global_memory_bus_width(backend, device)
+    bw_gbps = mem_clock_khz * bus_width * 2 / 1e6 / 8  # In GB/s
+    return bw_gbps
+
+
+def get_max_tensorcore_tflops(dtype: torch.dtype, backend=None, device=None, clock_rate=None):
+    if not backend:
+        backend = _triton.runtime.backend.CUDA
+    if not device:
+        device = torch.cuda.current_device()
+    num_subcores = _triton.runtime.num_sm(backend, device) * 4  # on recent GPUs
+    if not clock_rate:
+        clock_rate = _triton.runtime.clock_rate(backend, device)  # in kHz
+    cc = _triton.runtime.cc(backend, device)
+    if cc < 80:
+        assert dtype == torch.float16
+        ops_per_sub_core = 256  # 2 4x4x4 Tensor Cores
+    else:
+        if dtype == torch.float32:
+            ops_per_sub_core = 256
+        elif dtype in [torch.float16, torch.bfloat16]:
+            ops_per_sub_core = 512
+        elif dtype == torch.int8:
+            ops_per_sub_core = 1024
+        else:
+            raise RuntimeError("dtype not supported")
+    tflops = num_subcores * clock_rate * ops_per_sub_core * 1e-9
+    return tflops
+
+
+def get_max_simd_tflops(dtype: torch.dtype, backend=None, device=None):
+    if not backend:
+        backend = _triton.runtime.backend.CUDA
+    if not device:
+        device = torch.cuda.current_device()
+    num_subcores = _triton.runtime.num_sm(backend, device) * 4  # on recent GPUs
+    clock_rate = _triton.runtime.clock_rate(backend, device)  # in kHz
+    cc = _triton.runtime.cc(backend, device)
+    if cc < 80:
+        if dtype == torch.float32:
+            ops_per_sub_core = 32  # 2*16
+        elif dtype == torch.float16:
+            ops_per_sub_core = 64
+        else:
+            raise RuntimeError("dtype not supported")
+    else:
+        if dtype == torch.float32:
+            ops_per_sub_core = 32
+        elif dtype in [torch.float16, torch.bfloat16]:
+            ops_per_sub_core = 64
+        else:
+            raise RuntimeError("dtype not supported")
+    tflops = num_subcores * clock_rate * ops_per_sub_core * 1e-9
+    return tflops

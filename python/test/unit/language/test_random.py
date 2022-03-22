@@ -1,15 +1,15 @@
-import torch
-import triton
-import triton.language as tl
+import numpy as np
 import pytest
 import scipy.stats
-import numpy as np
+import torch
 
-from numpy.random import Philox
+import triton
+import triton.language as tl
 
 #####################################
-## Reference Philox Implementation
+# Reference Philox Implementation
 #####################################
+
 
 class PhiloxConfig:
     def __init__(self, PHILOX_ROUND_A, PHILOX_ROUND_B, PHILOX_KEY_A, PHILOX_KEY_B, DTYPE):
@@ -74,9 +74,8 @@ class CustomPhilox4x:
         return np.array([ret0, ret1, ret2, ret3], dtype=self._dtype)
 
     def _raise_key(self, key):
-        ret0 = key[0] + self._config.PHILOX_KEY_A
-        ret1 = key[1] + self._config.PHILOX_KEY_B
-        return np.array([ret0, ret1], dtype=self._dtype)
+        pk = [self._config.PHILOX_KEY_A, self._config.PHILOX_KEY_B]
+        return key + np.array(pk, dtype=self._dtype)
 
     def random_raw(self):
         counter = self._counter
@@ -104,18 +103,21 @@ class CustomPhilox(CustomPhilox4x):
 
 
 #####################################
-## Unit Tests
+# Unit Tests
 #####################################
 
 BLOCK = 1024
 
 # test generation of random uint32
+
+
 @pytest.mark.parametrize('size, seed',
-    [(size, seed) for size in ['10', '4,53', '10000']\
-                  for seed in [0, 42, 124, 54, 0xffffffff, 0xdeadbeefcafeb0ba]]
-)
+                         [(size, seed) for size in ['10', '4,53', '10000']
+                          for seed in [0, 42, 124, 54, 0xffffffff, 0xdeadbeefcafeb0ba]]
+                         )
 def test_randint(size, seed, device='cuda'):
     size = list(map(int, size.split(',')))
+
     @triton.jit
     def kernel(X, N, seed):
         offset = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
@@ -132,39 +134,13 @@ def test_randint(size, seed, device='cuda'):
     out_ref = [gen.random_raw()[0] for _ in out_tri]
     assert out_tri == out_ref
 
-# test conversion of random uint32 into random float in [0, 1]
-def test_uint32_to_uniform_float():
-    @triton.jit
-    def kernel(SRC, TGT, N, **meta):
-        pid = tl.program_id(0)
-        offset = pid * BLOCK + tl.arange(0, BLOCK)
-        src = tl.load(SRC + offset)
-        tgt = tl.random.uint32_to_uniform_float(src)
-        tl.store(TGT + offset, tgt, mask=offset < N)
-    
-    def run(source):
-        target = -torch.ones(source.shape, dtype=torch.float32, device=source.device)
-        N = source.numel()
-        grid = lambda meta: (triton.cdiv(N, BLOCK),)
-        kernel[grid](source, target, N)
-        return target
-        
-    # check range of edge values
-    n = 100
-    source = torch.tensor(list(range(n)) + list(range(-n, 0)), dtype=torch.int32).cuda()
-    target = run(source).tolist()
-    assert target == sorted(target)
-    assert all(0.0 <= num < 1.0 for num in target)
-    # check distribution is uniform
-    source = torch.randint(-2**31, 2**31 - 1, dtype=torch.int32, size=(100000,)).cuda()
-    target = run(source).tolist()
-    assert scipy.stats.kstest(target, 'uniform', args=(0, 1)).statistic < 0.01
-
 # test uniform PRNG
+
+
 @pytest.mark.parametrize('size, seed',
-    [(size, seed) for size in [1000000]\
-                  for seed in [0, 42, 124, 54]]
-)
+                         [(size, seed) for size in [1000000]
+                          for seed in [0, 42, 124, 54]]
+                         )
 def test_rand(size, seed, device='cuda'):
     @triton.jit
     def kernel(X, N, seed):
@@ -176,13 +152,16 @@ def test_rand(size, seed, device='cuda'):
     N = x.numel()
     grid = (triton.cdiv(N, BLOCK),)
     kernel[grid](x, N, seed)
+    assert all((x >= 0) & (x <= 1))
     assert scipy.stats.kstest(x.tolist(), 'uniform', args=(0, 1)).statistic < 0.01
 
 # test normal PRNG
+
+
 @pytest.mark.parametrize('size, seed',
-    [(size, seed) for size in [1000000]\
-                  for seed in [0, 42, 124, 54]]
-)
+                         [(size, seed) for size in [1000000]
+                          for seed in [0, 42, 124, 54]]
+                         )
 def test_randn(size, seed, device='cuda'):
     @triton.jit
     def kernel(X, N, seed):

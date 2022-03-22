@@ -20,7 +20,9 @@
 * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 */
 #include <fstream>
-#include <unistd.h>
+#if __has_include(<unistd.h>)
+    #include <unistd.h>
+#endif
 #include <memory>
 #include <regex>
 #include "triton/driver/llvm.h"
@@ -46,6 +48,7 @@
 #include "llvm/ExecutionEngine/ExecutionEngine.h"
 #include "llvm/ExecutionEngine/SectionMemoryManager.h"
 #include "llvm/Transforms/Utils/Cloning.h"
+#include "llvm/Transforms/Scalar.h"
 
 // begin AMD stuff
 #include "llvm/Support/FileSystem.h"
@@ -55,6 +58,13 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
 // end AMD stuff
+
+extern "C"{
+  int set_curterm(char* nterm){ return 0; }
+  int del_curterm(char* nterm){ return 0; }
+  int tigetnum(char *capname) { return 0; }
+  int setupterm(char *term, int fildes, int *errret) { return 0; }
+}
 
 namespace triton{
 namespace driver{
@@ -74,6 +84,7 @@ void init_llvm() {
   }
 }
 
+
 /* ------------------------ */
 //         CUDA             //
 /* ------------------------ */
@@ -86,7 +97,42 @@ static bool find_and_replace(std::string& str, const std::string& begin, const s
   return true;
 }
 
+std::string path_to_ptxas(int& version) {
+  std::string ret;
+  // search pathes for ptxas
+  std::vector<std::string> ptxas_prefixes = {"", "/usr/local/cuda/bin/"};
+  std::string triton_ptxas = tools::getenv("TRITON_PTXAS_PATH");
+  if(!triton_ptxas.empty())
+    ptxas_prefixes.insert(ptxas_prefixes.begin(), triton_ptxas);
+  // see what path for ptxas are valid
+  std::vector<std::string> working_ptxas;
+  for(std::string prefix: ptxas_prefixes){
+    std::string ptxas = prefix + "ptxas";
+    bool works = tools::exec(ptxas + " --version 2>&1", ret) == 0;
+    if(works)
+      working_ptxas.push_back(ptxas);
+  }
+  // error if no working ptxas was found
+  if(working_ptxas.empty())
+    throw std::runtime_error("`ptxas` was searched in TRITON_PTXAS_PATH, /usr/local/cuda/bin/ or PATH"
+                             " but a working version could not be found.");
+  std::string ptxas = working_ptxas.front();
+  // parse version
+  std::regex version_regex("release (\\d+)\\.(\\d+)");
+  std::smatch match;
+  if(std::regex_search(ret, match, version_regex)){
+    int major = std::stoi(match[1]);
+    int minor = std::stoi(match[2]);
+    version = major*1000 + minor*10;
+  }
+  else
+    throw std::runtime_error("couldn't parse ptxas version: " + ret);
+  return ptxas;
+}
+
+
 int vptx(int version){
+  if(version >= 11040) return 74;
   if(version >= 11030) return 73;
   if(version >= 11020) return 72;
   if(version >= 11010) return 71;
@@ -100,7 +146,7 @@ int vptx(int version){
 std::string llir_to_ptx(llvm::Module* module, int cc, int version){
   // LLVM version in use may not officially support target hardware
   int max_nvvm_cc = 75;
-  int max_nvvm_ptx = 64;
+  int max_nvvm_ptx = 74;
   // options
   auto options = llvm::cl::getRegisteredOptions();
   auto* short_ptr = static_cast<llvm::cl::opt<bool>*>(options["nvptx-short-ptr"]);
@@ -117,12 +163,17 @@ std::string llir_to_ptx(llvm::Module* module, int cc, int version){
   std::string triple = "nvptx64-nvidia-cuda";
   std::string proc = "sm_" + std::to_string(std::min(cc, max_nvvm_cc));
   std::string layout = "";
-  std::string features = "+ptx" + std::to_string(std::min(ptx, max_nvvm_ptx));
+  std::string features = "";
+  // std::string features = "+ptx" + std::to_string(std::min(ptx, max_nvvm_ptx));
   init_llvm();
   // verify and store llvm
   llvm::legacy::PassManager pm;
   pm.add(llvm::createVerifierPass());
+  // pm.add(llvm::createDeadCodeEliminationPass());
+  // pm.add(llvm::createEarlyCSEPass());
   pm.run(*module);
+  // module->print(llvm::outs(), nullptr);
+
   // create machine
   module->setTargetTriple(triple);
   std::string error;
@@ -157,95 +208,39 @@ std::string llir_to_ptx(llvm::Module* module, int cc, int version){
   return result;
 }
 
-std::string ptx_to_cubin(const std::string& ptx, int cc) {
-  std::string ptxas = "ptxas";
-  std::string version;
-  int use_system_ptxas = tools::exec(ptxas + " --version 2>&1", version) == 0;
-  if(!use_system_ptxas)
-    return "";
-
+std::string ptx_to_cubin(const std::string& ptx, const std::string& ptxas, int cc) {
   // compile ptx with ptxas
-  char _fsrc[] = "/tmp/triton_k_XXXXXX";
-  char _flog[] = "/tmp/triton_l_XXXXXX";
-  mkstemp(_fsrc);
-  mkstemp(_flog);
+  char _fsrc[L_tmpnam];
+  char _flog[L_tmpnam];
+  std::tmpnam(_fsrc);
+  std::tmpnam(_flog);
   std::string fsrc = _fsrc;
   std::string flog = _flog;
   std::string fbin = fsrc + ".o";
   const char* _fbin = fbin.c_str();
   std::ofstream ofs(fsrc);
-  ofs << ptx;
+  ofs << ptx << std::endl;
   ofs.close();
   std::string cmd;
   int err;
   cmd = ptxas + " -v --gpu-name=sm_" + std::to_string(cc) + " " + fsrc + " -o " + fsrc + ".o 2> " + flog;
   err = system(cmd.c_str());
+  if(err != 0){
+    std::ifstream _log(_flog);
+    std::string log(std::istreambuf_iterator<char>(_log), {});
+    unlink(_fsrc);
+    unlink(_flog);
+    throw std::runtime_error("Internal Triton PTX codegen error: \n" + log);
+  }
   CUmodule ret;
   std::ifstream _cubin(_fbin, std::ios::binary );
   std::string cubin(std::istreambuf_iterator<char>(_cubin), {});
   _cubin.close();
-  dispatch::cuModuleLoadData(&ret, cubin.c_str());
   unlink(_fsrc);
   unlink(_flog);
   unlink(_fbin);
+  dispatch::cuModuleLoadData(&ret, cubin.c_str());
   return cubin;
-}
-
-CUmodule ptx_to_cumodule(const std::string& ptx, int cc) {
-  // JIT compile source-code
-  try{
-    // use ptxas if present in PATH. Otherwise, use JIT from the driver
-    std::string ptxas = "ptxas";
-    std::string version;
-    int use_system_ptxas = tools::exec(ptxas + " --version 2>&1", version) == 0;
-
-    // Use PTXAS via system call
-    if(use_system_ptxas){
-      // compile ptx with ptxas
-      char _fsrc[] = "/tmp/triton_k_XXXXXX";
-      char _flog[] = "/tmp/triton_l_XXXXXX";
-      mkstemp(_fsrc);
-      mkstemp(_flog);
-      std::string fsrc = _fsrc;
-      std::string flog = _flog;
-      std::string fbin = fsrc + ".o";
-      const char* _fbin = fbin.c_str();
-      std::ofstream ofs(fsrc);
-      ofs << ptx;
-      ofs.close();
-      std::string cmd;
-      int err;
-      cmd = ptxas + " -v --gpu-name=sm_" + std::to_string(cc) + " " + fsrc + " -o " + fsrc + ".o 2> " + flog;
-      err = system(cmd.c_str());
-      CUmodule ret;
-      std::ifstream _cubin(_fbin, std::ios::binary );
-      std::string cubin(std::istreambuf_iterator<char>(_cubin), {});
-      _cubin.close();
-      dispatch::cuModuleLoadData(&ret, cubin.c_str());
-      unlink(_fsrc);
-      unlink(_flog);
-      unlink(_fbin);
-      return ret;
-    }
-
-    // Use PTXAS included in driver
-    CUjit_option opt[] = {CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES, CU_JIT_ERROR_LOG_BUFFER,
-                          CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES, CU_JIT_INFO_LOG_BUFFER,
-                          CU_JIT_LOG_VERBOSE};
-    unsigned int errbufsize = 8192;
-    unsigned int logbufsize = 8192;
-    char _err[errbufsize];
-    char _log[logbufsize];
-    void* optval[] = {(void*)(uintptr_t)errbufsize, (void*)_err, (void*)(uintptr_t)logbufsize, (void*)_log, (void*)1};
-    CUmodule ret;
-    dispatch::cuModuleLoadDataEx(&ret, ptx.data(), 5, opt, optval);
-    return ret;
-  }
-  catch(exception::cuda::invalid_ptx const &){
-    std::cout << ptx << std::endl;
-    std::cerr << "It appears that Triton produced invalid PTX code:" << std::endl;
-    throw;
-  }
 }
 
 /* ------------------------ */
@@ -344,8 +339,8 @@ hipModule_t amdgpu_to_hipmodule(const std::string& path) {
   hipJitOption opt[] = {hipJitOptionErrorLogBufferSizeBytes, hipJitOptionErrorLogBuffer,
                             hipJitOptionInfoLogBufferSizeBytes, hipJitOptionInfoLogBuffer,
                             hipJitOptionLogVerbose};
-  unsigned int errbufsize = 8192;
-  unsigned int logbufsize = 8192;
+  const unsigned int errbufsize = 8192;
+  const unsigned int logbufsize = 8192;
   char _err[errbufsize];
   char _log[logbufsize];
   void* optval[] = {(void*)(uintptr_t)errbufsize,

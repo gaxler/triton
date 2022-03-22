@@ -6,6 +6,7 @@
 #include <cassert>
 #include <vector>
 #include <string>
+#include <stdexcept>
 
 namespace triton{
 namespace ir{
@@ -74,14 +75,12 @@ public:
   bool is_fp8_ty() const                { return id_ == FP8TyID; }
   bool is_fp16_ty() const               { return id_ == FP16TyID; }
   bool is_bf16_ty() const               { return id_ == BF16TyID; }
-  bool is_fp32_ty() const              { return id_ == FP32TyID; }
-  bool is_fp64_ty() const             { return id_ == FP64TyID; }
+  bool is_fp32_ty() const               { return id_ == FP32TyID; }
+  bool is_fp64_ty() const               { return id_ == FP64TyID; }
   bool is_label_ty()  const             { return id_ == LabelTyID;}
   bool is_metadata_ty() const           { return id_ == MetadataTyID; }
   bool is_token_ty() const              { return id_ == TokenTyID; }
   bool is_integer_ty() const            { return id_ == IntegerTyID; }
-  bool is_integer_ty(unsigned bitwidth) { return is_integer_ty() &&
-                                                 get_integer_bitwidth() == bitwidth;}
   bool is_bool_ty() const               { return is_integer_ty(1); }
   bool is_pointer_ty() const            { return id_ == PointerTyID; }
   bool is_block_ty() const               { return id_ == BlockTyID; }
@@ -131,18 +130,18 @@ public:
       case FP16TyID: return "f16";
       case FP32TyID: return "f32";
       case FP64TyID: return "f64";
+      case BF16TyID: return "bf16";
       case LabelTyID: return "label";
       case MetadataTyID: return "md";
       case TokenTyID: return "tok";
-      case IntegerTyID: return "i" + std::to_string(get_integer_bitwidth());
+      case IntegerTyID: return ("i") + std::to_string(get_integer_bitwidth());
       case FunctionTyID: return "fn";
       case PointerTyID: return get_pointer_element_ty()->repr() + "*";
       case StructTyID: return "struct";
       case BlockTyID: return tile_repr();
       default: break;
     }
-    assert(false);
-    return "";
+    throw std::logic_error("unknown type id '" + std::to_string(id_) + "'");
   };
 
 private:
@@ -159,7 +158,7 @@ class integer_type: public type {
 private:
   // constructors
   integer_type(context &ctx, unsigned bitwidth)
-    : type(ctx, IntegerTyID), bitwidth_(bitwidth){ }
+    : type(ctx, IntegerTyID), bitwidth_(bitwidth) {}
 
 public:
   // accessors

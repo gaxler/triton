@@ -48,10 +48,10 @@ void builder::set_insert_point(basic_block *block){
 value *builder::get_int1(bool val)
 { return constant_int::get(type::get_int1_ty(ctx_), val); }
 
-value *builder::get_int32(int32_t val)
+value *builder::get_int32(uint32_t val)
 { return constant_int::get(type::get_int32_ty(ctx_), val);}
 
-value *builder::get_int64(int64_t val)
+value *builder::get_int64(uint64_t val)
 { return constant_int::get(type::get_int64_ty(ctx_), val);}
 
 value *builder::get_float16(float val)
@@ -84,8 +84,14 @@ type *builder::get_int32_ty()
 type *builder::get_int64_ty()
 { return type::get_int64_ty(ctx_); }
 
+type *builder::get_fp8_ty()
+{ return type::get_fp8_ty(ctx_); }
+
 type *builder::get_half_ty()
 { return type::get_fp16_ty(ctx_); }
+
+type *builder::get_bf16_ty()
+{ return type::get_bf16_ty(ctx_); }
 
 type *builder::get_float_ty()
 { return type::get_fp32_ty(ctx_); }
@@ -121,6 +127,8 @@ value *builder::create_ret_void() {
     return create_cast(OPCODE, src, dst_ty);\
   }
 
+DEFINE_CAST_INSTR(bitcast, cast_op_t::BitCast)
+DEFINE_CAST_INSTR(int_to_ptr, cast_op_t::IntToPtr)
 DEFINE_CAST_INSTR(ptr_to_int, cast_op_t::PtrToInt)
 DEFINE_CAST_INSTR(si_to_fp, cast_op_t::SIToFP)
 DEFINE_CAST_INSTR(ui_to_fp, cast_op_t::UIToFP)
@@ -273,16 +281,16 @@ DEFINE_FCMP_INSTR(UNE, cmp_pred_t::FCMP_UNE)
 //                               load/store instructions
 //===----------------------------------------------------------------------===//
 
-value *builder::create_load(value *ptr){
-  return insert(unmasked_load_inst::create(ptr));
+value *builder::create_load(value *ptr, load_inst::CACHE_MODIFIER cache, load_inst::EVICTION_POLICY eviction, bool is_volatile){
+  return insert(unmasked_load_inst::create(ptr, cache, eviction, is_volatile));
 }
 
 value *builder::create_store(value *ptr, value *val){
   return insert(unmasked_store_inst::create(ptr, val));
 }
 
-value *builder::create_masked_load(value *ptr, value *mask, value *false_value){
-  return insert(masked_load_inst::create(ptr, mask, false_value));
+value *builder::create_masked_load(value *ptr, value *mask, value *false_value, load_inst::CACHE_MODIFIER cache, load_inst::EVICTION_POLICY eviction, bool is_volatile){
+  return insert(masked_load_inst::create(ptr, mask, false_value, cache, eviction, is_volatile));
 }
 
 value *builder::create_masked_store(value *ptr, value *val, value *mask){
@@ -297,6 +305,10 @@ value *builder::create_reshape(value *arg, const type::block_shapes_t &shapes) {
   return insert(reshape_inst::create(arg, shapes));
 }
 
+value *builder::create_cat(value *lhs, value *rhs) {
+  return insert(cat_inst::create(lhs, rhs));
+}
+
 value *builder::create_splat(value *arg, const type::block_shapes_t &shapes) {
   return insert(splat_inst::create(arg, shapes));
 }
@@ -308,6 +320,28 @@ value *builder::create_broadcast(value *arg, const type::block_shapes_t &shapes)
 value *builder::create_downcast(value *arg) {
   return insert(downcast_inst::create(arg));
 }
+
+//
+
+value *builder::create_atomic_rmw(ir::atomic_rmw_op_t op, value *ptr, value *val, value *msk){
+  return insert(atomic_rmw_inst::create(op, ptr, val, msk));
+}
+
+#define DEFINE_ATOMIC_RMW_INSTR(SUFFIX, OPCODE)\
+  value *builder::create_ ## SUFFIX(value *ptr, value *val, value *mask){\
+    return create_atomic_rmw(OPCODE, ptr, val, mask);\
+  }
+
+DEFINE_ATOMIC_RMW_INSTR(atomic_max, ir::atomic_rmw_op_t::Max)
+DEFINE_ATOMIC_RMW_INSTR(atomic_umax, ir::atomic_rmw_op_t::UMax)
+DEFINE_ATOMIC_RMW_INSTR(atomic_min, ir::atomic_rmw_op_t::Min)
+DEFINE_ATOMIC_RMW_INSTR(atomic_umin, ir::atomic_rmw_op_t::UMin)
+DEFINE_ATOMIC_RMW_INSTR(atomic_fadd, ir::atomic_rmw_op_t::FAdd)
+DEFINE_ATOMIC_RMW_INSTR(atomic_add, ir::atomic_rmw_op_t::Add)
+DEFINE_ATOMIC_RMW_INSTR(atomic_and, ir::atomic_rmw_op_t::And)
+DEFINE_ATOMIC_RMW_INSTR(atomic_or, ir::atomic_rmw_op_t::Or)
+DEFINE_ATOMIC_RMW_INSTR(atomic_xor, ir::atomic_rmw_op_t::Xor)
+DEFINE_ATOMIC_RMW_INSTR(atomic_xchg, ir::atomic_rmw_op_t::Xchg)
 
 //===----------------------------------------------------------------------===//
 //                               built-in instructions
@@ -325,9 +359,6 @@ value *builder::create_atomic_cas(value *ptr, value *cmp, value *val){
   return insert(atomic_cas_inst::create(ptr, cmp, val));
 }
 
-value *builder::create_atomic_rmw(ir::atomic_rmw_op_t op, value *ptr, value *val, value *msk){
-  return insert(atomic_rmw_inst::create(op, ptr, val, msk));
-}
 
 value *builder::create_exp(value *arg){
   return insert(exp_inst::create(arg));
@@ -345,8 +376,8 @@ value *builder::create_log(value *arg){
   return insert(log_inst::create(arg));
 }
 
-value *builder::create_dot(value *A, value *B, value *C) {
-  return insert(dot_inst::create_nn(A, B, C));
+value *builder::create_dot(value *A, value *B, value *C, bool allow_tf32) {
+  return insert(dot_inst::create_nn(A, B, C, allow_tf32));
 }
 
 value *builder::create_trans(value *A, const std::vector<int>& perm) {
@@ -369,6 +400,9 @@ value *builder::create_select(value *pred, value *if_value, value *else_value){
 //                               intrinsic instructions
 //===----------------------------------------------------------------------===//
 
+value *builder::create_umulhi(value *lhs, value *rhs) {
+  return insert(umulhi_inst::create(lhs, rhs));
+}
 
 value *builder::create_copy_to_shared(value *arg) {
   return insert(copy_to_shared_inst::create(arg));
@@ -379,8 +413,8 @@ value *builder::create_copy_from_shared(value *arg) {
   return insert(copy_from_shared_inst::create(arg));
 }
 
-value *builder::create_masked_load_async(value *ptr, value *mask, value *false_value) {
-  return insert(masked_load_async_inst::create(ptr, mask, false_value));
+value *builder::create_masked_load_async(value *ptr, value *mask, value *false_value, load_inst::CACHE_MODIFIER cache, load_inst::EVICTION_POLICY eviction) {
+  return insert(masked_load_async_inst::create(ptr, mask, false_value, cache, eviction));
 }
 
 value *builder::create_barrier(const std::string &name) {
