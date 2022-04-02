@@ -73,7 +73,8 @@ class AbstractPtr(AbstractValue):
         self.device = device
 
     def data_ptr(self):
-        return
+        # TODO: triton does alignment optimization. We will make this return all possible alignments (maybe 4,8,16?)
+        return 140010382688256
 
 
 TYPE_MAKERS = {

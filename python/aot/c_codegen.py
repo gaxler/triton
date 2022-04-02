@@ -183,6 +183,7 @@ def _make_kernel_dispatcher_header_source(
         }
 
     header = "{common}\n{kernel_headers}\n{dispatcher_header}".format(**data)
+
     source = """
 #include "{name}.h"
 

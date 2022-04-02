@@ -128,5 +128,3 @@ if __name__ == "__main__":
         compiler.export_c_code("/home/aitu17/data-infra/triton/aot/test_data/gen_test")
 
 
-
-    return

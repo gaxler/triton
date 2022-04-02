@@ -41,7 +41,7 @@ class CInputSigneture:
     def arg_pointers(self) -> str:
         return ", ".join([f"&{arg}" for arg in self.arg_names])
 
-    def signeture(self) -> str:
+    def signature(self) -> str:
         sig = ""
         for arg, ty in zip(self.arg_names, self.input_types):
             if isinstance(ty, AbstractPtr):
@@ -123,7 +123,7 @@ class _SingleKernelCSource(CSource):
         data = {
             "name": self.name,
             "bin_size": bin_size,
-            "kernel_signeture": signeture.signeture(),
+            "kernel_signeture": signeture.signature(),
             "hex_": hex_,
             "num_args": len(signeture),
             "arg_pointers": signeture.arg_pointers(),
@@ -171,7 +171,7 @@ CUresult {name}(CUstream stream, GridWarps g, {kernel_signeture})
         self._source = source.format(**data)
 
     def signeture(self):
-        return CInputSigneture(self.input_types, self.arg_names).signeture()
+        return CInputSigneture(self.input_types, self.arg_names).signature()
 
     def dispatch_cond(self) -> str:
         attrs = [name for v, name in zip(self.input_types, self.arg_names) if v.is_attr]
@@ -198,13 +198,13 @@ class KernelDispatcher(CSource):
         self,
         triton_output: str, # ptx/cubin etc. Whatever cuda is going to lauch
         attribute_values: Sequence[int], # attribute sizes  that the kernel was optimized for
-        signeture: Sequence[AbstractValue], # input signeture of the kernel (types with attribute sizes etc)
+        signature: Sequence[AbstractValue], # input signeture of the kernel (types with attribute sizes etc)
         arg_names: Sequence[str],  # names of 
     ):
         new_ker_name = f"{self.name}_" + "_".join(map(str, attribute_values))
         ptx = triton_output.replace(self.name, new_ker_name)
         single_ker = _SingleKernelCSource(
-            new_ker_name, ptx, attribute_values, signeture, arg_names
+            new_ker_name, ptx, attribute_values, signature, arg_names
         )
         self.kernels.append(single_ker)
 

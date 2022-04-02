@@ -75,7 +75,7 @@ class Compiler:
 
         print(f"Compiling {kernel_name}...:")
         code_gen = KernelDispatcher(kernel_name)
-        
+
         for sig in sig_generator(pointers, attributes, attr_sizes, self.attr_size_scope):
             _, bin_ = kernel.aot_compile(
                 *sig,
@@ -89,7 +89,6 @@ class Compiler:
             ptx = bin_.asm('ptx')
             code_gen.add_kernel(ptx, attr_vals, sig, func.arg_names)
             
-
             sig_repr = " ".join([f"{n}:{s}" for n, s in zip(func.arg_names, sig)])
             print(f"\t-> Done: {sig_repr}")
         

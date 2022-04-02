@@ -33,6 +33,10 @@ class AbstractValue:
 
 class AbstractInt(AbstractValue, int):
     def __new__(cls, num, tt_dtype):
+        """ 
+        we need the tt_dtype here since we can have several integer sizes (i32,i64,...).
+        we need to pass this information to triton compiler later on
+        """
         res = super(AbstractInt, cls).__new__(cls, num)
         res._tt_dtype = tt_dtype
         res.num = num
@@ -41,6 +45,10 @@ class AbstractInt(AbstractValue, int):
 
 class AbstractFloat(AbstractValue, float):
     def __new__(cls, num, tt_dtype):
+        """ 
+        we need the tt_dtype here since we can have several float sizes (f32,bf32,...).
+        we need to pass this information to triton compiler later on
+        """
         res = super(AbstractFloat, cls).__new__(cls, num)
         res._tt_dtype = tt_dtype
         res.num = num
