@@ -37,7 +37,9 @@ def add_kernel(
 
 
 if __name__ == "__main__":
-    
+    import torch
+    x = torch.empty(1, device="cuda")
+
     scope = {"A": [16, 24], "K": [1, 8], "M": [1, 8], "N": [1, 8]}
     conf = TritonCompileConfig(device_idx=0)
     compile(add_kernel, ['f32', 'f32', 'f32'], ['i64'], ['A'], scope=scope, conf=conf, BLOCK_SIZE=1024)
