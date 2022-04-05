@@ -60,6 +60,7 @@ def compile(func: JITFunction, pointers: Sequence[str], attributes: Sequence[str
         compile = dict(arg_types=arg_types, device=conf.device_idx, attributes=attributes, constants=constants, num_warps=conf.num_warps, num_stages=conf.num_stages)
         attrib_sizes = [Kernel.pow2_divisor(s.val) for s in wargs if isinstance(s, AbstractValue) and s.is_attr]
         bin_ = func._compile(**compile)
+        ptx = bin_.asm['ptx']
         pass
         
     return
