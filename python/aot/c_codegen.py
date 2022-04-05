@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from typing import Sequence, Tuple
 
 from .abstract_values import TRITON_TO_C_TYPES
+from .sig_annotation_dsl import SignatureTokens, tokenize_signature_annotation
 
 THREADS_PER_WARP = 32
 
@@ -40,6 +41,7 @@ class KernelSignatureData:
     pointer_types: Sequence[str]
     attribute_names: Sequence[str]
     attribute_types: Sequence[str]
+    attr_size_vars: Sequence[str]
 
     @property
     def total_kernel_arguments(self):
@@ -47,7 +49,19 @@ class KernelSignatureData:
 
     @property
     def all_argument_names(self):
-        return self.pointer_names + self.pointer_types
+        return self.pointer_names + self.attribute_names
+
+    @classmethod
+    def parse_sig_dsl(cls, sig_ann: str, arg_names: Sequence[str]):
+        tokens: SignatureTokens  = tokenize_signature_annotation(sig_ann, arg_names)
+        return KernelSignatureData(
+            pointer_names=tokens.pointer_names,
+            pointer_types=tokens.pointers,
+            attribute_names=tokens.attribute_names,
+            attribute_types=tokens.attributes,
+            attr_size_vars=tokens.attribute_sizes
+        )
+
 
 
 # def make_kernel_signature(poiniter_types: Sequence[str], attribute_types: Sequence[str], arg_names: Sequence[str]):
@@ -55,7 +69,7 @@ def make_kernel_signature(sig_data: KernelSignatureData):
     """
     Assuming that kernel signature follow the following pattern (pointers..., attribure..., constexpr...)
     """
-    pointers = [f"CUdeviceptr {arg}" for arg in sig_data.all_argument_names]
+    pointers = [f"CUdeviceptr {arg}" for arg in sig_data.pointer_names]
     attributes = []
     for ty, arg in zip(sig_data.attribute_types, sig_data.attribute_names):
         dtype = TRITON_TO_C_TYPES[ty]
@@ -118,12 +132,12 @@ def _make_dispatch_condition_expr(attr_names, attr_sizes: Sequence[int]):
     return " & ".join([f"{k} % {v} == 0" for k, v in zip(attr_names, attr_sizes)])
 
 
-def _make_kernel_dispatcher_header_source(
+def make_kernel_dispatcher_header_source(
     name: str,
-    common_h: str,
     binaries: Sequence[str],
     attr_sizes: Sequence[Sequence[int]],
     sig_data: KernelSignatureData,
+    common_h: str = common_header
 ):
     kernel_names = []
     kernel_headers = []
@@ -158,15 +172,14 @@ def _make_kernel_dispatcher_header_source(
         # TODO: what if we use some other, non-cuda backend? this whole setup needs to change in that case
         # TODO: multiple backend support is not something that the AOT supports at this point.
         h, src = _make_kernel_header_source(
-            name, sig_data, hex_, bin_size, threads_per_warp=THREADS_PER_WARP
+            new_ker_name, sig_data, hex_, bin_size, threads_per_warp=THREADS_PER_WARP
         )
 
         kernel_headers.append(h)
         kernel_src.append(src)
         dispatch_cond_exprs.append(dispatch)
 
-    kernel_sig = make_kernel_signature(sig_data)
-    dispatcher_sig = f"CUresult {name}(CUstream stream, GridWarps g, {kernel_sig})"
+    dispatcher_sig = f"CUresult {name}(CUstream stream, GridWarps g, {make_kernel_signature(sig_data)})"
     dispatcher_body = "\n".join(dispatch_cond_exprs)
     dispatcher_func = """
 {dispatcher_sig} {{
@@ -179,7 +192,7 @@ def _make_kernel_dispatcher_header_source(
         "kernel_headers": "\n\n".join(kernel_headers),
         "kernel_sources": "\n\n".join(kernel_src),
         "dispatcher_header": f"{dispatcher_sig};",
-        "dispatcher_source": dispatcher_func,
+        "dispatcher_source": dispatcher_func.format(dispatcher_sig=dispatcher_sig, dispatcher_body=dispatcher_body),
         }
 
     header = "{common}\n{kernel_headers}\n{dispatcher_header}".format(**data)
