@@ -56,6 +56,7 @@ def sig_generator(
     attributes: Sequence[str],
     attr_vars: Sequence[str],
     named_vars: NamedVariantsMap,
+    constants_scope: NamedVariantsMap = None
 ) -> Iterator[Sequence[AbstractValue]]:
 
     abstract_pointers = [AbstractPtr(p, DummyCudaDevice(0)) for p in pointers]
@@ -66,6 +67,6 @@ def sig_generator(
     )
 
     for concrete_val_dict in dict_product(dup_named_vars):
-        concrete_vals = map(concrete_val_dict.__get_item__, dup_attr_vars)
+        concrete_vals = map(concrete_val_dict.__getitem__, dup_attr_vars)
         abstract_vals = [f(v) for f, v in zip(abstract_attr_makers, concrete_vals)]
         yield abstract_pointers[:] + abstract_vals
