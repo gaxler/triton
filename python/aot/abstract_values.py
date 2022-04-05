@@ -22,11 +22,14 @@ class AbstractValue:
 
     def __repr__(self) -> str:
         cls_name = self.__class__.__name__.replace("Input", "")
+        # TODO: new mangle function expects attributes to return numbers. i think code_gen.py is the place to fix that. meanwhile, this HACK is here
+        if self.is_attr:
+            return str(self.num)
 
         repr = f"<{self.tt_dtype}"
         if "Ptr" in cls_name:
             repr += "*"
-        if hasattr(self, "num"):
+        if self.is_attr:
             repr += f",{self.num}"
         repr += ">"
         return repr
