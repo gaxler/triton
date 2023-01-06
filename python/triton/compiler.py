@@ -1028,13 +1028,6 @@ def ty_to_cpp(ty):
     }[ty]
 
 
-def generate_name_initializer(signature):
-    src = "int i = 0;\n"
-    tys = signature.split(',')
-    for i, ty in enumerate(tys):
-        src
-
-
 def binary_name_to_header_name(name):
     if len(name) > 128:
         # avoid filename too long errors (filename limit is 255)
