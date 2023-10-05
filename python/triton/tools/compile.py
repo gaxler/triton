@@ -118,8 +118,11 @@ if __name__ == "__main__":
 
     if args.debug_dump:
         for ir_name in ccinfo.asm:
-            with out_path.with_suffix(f".{sig_hash}_{suffix}.{ir_name}").open("w") as fp:
-                fp.write(ccinfo.asm[ir_name])
+            f = out_path.with_suffix(f".{sig_hash}_{suffix}.{ir_name}")
+            if type(ccinfo.asm[ir_name]) is str:
+                f.write_text(ccinfo.asm[ir_name])
+            else:
+                f.write_bytes(ccinfo.asm[ir_name])
 
     func_name = '_'.join([out_name, sig_hash, suffix])
     triton_kernel_name = '_'.join([args.kernel_name, suffix])
