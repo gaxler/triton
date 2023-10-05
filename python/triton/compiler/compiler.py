@@ -535,6 +535,9 @@ def compile(fn, **kwargs):
             asm[ir_name] = str(next_module[0])
         else:
             asm[ir_name] = str(next_module)
+            if debug and hasattr(next_module, "bytecode"):
+                asm[f"{ir_name}.bin"] = next_module.bytecode()
+
         if ir_name == "llir" and "shared" not in metadata:
             if is_hip():
                 metadata["shared"] = _device_backend.get_shared_memory_size(module)

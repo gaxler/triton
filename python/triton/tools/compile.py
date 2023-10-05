@@ -49,6 +49,7 @@ if __name__ == "__main__":
     parser.add_argument("--signature", "-s", type=str, help="Signature of the kernel", required=True)
     parser.add_argument("--grid", "-g", type=str, help="Launch grid of the kernel", required=True)
     parser.add_argument("--debug-dump", "-dbg", action='store_true', help="Dump all IR and Cubin to files")
+    parser.add_argument("--cc", type=str, default=None,  help="Compute capability to compile for")
     args = parser.parse_args()
 
     out_name = args.out_name if args.out_name else args.kernel_name
@@ -105,7 +106,7 @@ if __name__ == "__main__":
     config = triton.compiler.instance_descriptor(divisible_by_16=divisible_by_16, equal_to_1=equal_to_1)
     for i in equal_to_1:
         constexprs.update({i: 1})
-    ccinfo = triton.compile(kernel, signature=signature, constants=constexprs, configs=[config], num_warps=args.num_warps, num_stages=args.num_stages)
+    ccinfo = triton.compile(kernel, signature=signature, constants=constexprs, configs=[config], num_warps=args.num_warps, num_stages=args.num_stages, cc=args.cc, debug=args.debug_dump)
     arg_names = []
     arg_types = []
     for i in signature.keys():
@@ -118,7 +119,8 @@ if __name__ == "__main__":
 
     if args.debug_dump:
         for ir_name in ccinfo.asm:
-            with out_path.with_suffix(f".{sig_hash}_{suffix}.{ir_name}").open("w") as fp:
+            ftype = "w" if isinstance(ccinfo.asm[ir_name], str) else "wb"
+            with out_path.with_suffix(f".{sig_hash}_{suffix}.{ir_name}").open(ftype) as fp:
                 fp.write(ccinfo.asm[ir_name])
 
     func_name = '_'.join([out_name, sig_hash, suffix])
